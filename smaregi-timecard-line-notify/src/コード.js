@@ -18,6 +18,7 @@ const SMN = Object.freeze({
   prefix: 'SMN_',
   donePrefix: 'SMN_DONE_',
   outboxKey: 'SMN_OUTBOX',
+  keyVersion: 'v2',
   handler: 'pollTimecard'
 });
 
@@ -37,7 +38,7 @@ function sendTestMessage() {
       throw new Error('勤怠通知の送信待ちがあります。先に pollTimecard を実行してください。');
     }
     if (!existing) {
-      writeOutbox_(c, key, 'スマレジ・タイムカードのLINE通知テストです。\nこのメッセージが届けば、LINE側の接続は完了です。');
+      writeOutbox_(c, key, 'スマレジ・タイムカードのLINE通知テストです。\nこのメッセージが届けば、LINE側の接続は完了です。', null);
     }
     sendOutbox_(c);
     console.log('テストをLINEへ送信しました。宛先の表示名: ' + clean_(profile.displayName));
@@ -79,9 +80,7 @@ function startNotifications() {
     if (!p.getProperty('SMN_STARTED_AT')) {
       const snapshot = events_(fetchResults_(c, new Date()), c);
       const now = Date.now();
-      const baseline = {};
-      snapshot.filter(e => e.at <= now).forEach(e => { baseline[e.key] = String(now); });
-      if (Object.keys(baseline).length) p.setProperties(baseline, false);
+      seedKnownEvents_(p, {}, snapshot, now);
       p.setProperties({'SMN_STARTED_AT': String(now), 'SMN_IDENTITY': identity}, false);
     }
     const current = ScriptApp.getProjectTriggers().filter(t => t.getHandlerFunction() === SMN.handler);
@@ -106,26 +105,41 @@ function pollTimecard() {
       const now = Date.now();
       const allEvents = events_(fetchResults_(c, new Date(now)), c);
       const known = p.getProperties();
+      if (p.getProperty('SMN_KEY_VERSION') !== SMN.keyVersion) {
+        // 打刻の識別方法を変更した直後の1回だけ、既存の打刻をまとめて通知済みにします。
+        // これをしないと、旧方式で通知済みの打刻がすべて新規として再通知されます。
+        seedKnownEvents_(p, known, allEvents, now);
+        console.log('打刻の識別方式を更新しました。既存の打刻は通知済みとして登録しています。');
+      }
       const started = Number(p.getProperty('SMN_STARTED_AT'));
       const cutoff = Math.max(started, now - SMN.maxAgeHours * 3600000);
       let sent = 0;
+      let corrections = 0;
       for (const e of allEvents) {
-        if (known[e.key] || e.at > now) continue;
+        if (e.at > now) continue;
+        const recorded = known[e.key];
+        const isKnown = recorded !== undefined && recorded !== null;
+        const previousAt = isKnown ? donePunchAt_(recorded) : null;
+        // 通知済みで時刻も同じなら何もしません。時刻だけが変わっていれば打刻修正です。
+        if (isKnown && (previousAt === null || previousAt === e.at)) continue;
         if (e.at < cutoff) {
-          p.setProperty(e.key, String(now));
-          known[e.key] = String(now);
+          const value = doneValue_(now, e.at);
+          p.setProperty(e.key, value);
+          known[e.key] = value;
           continue;
         }
         if (sent >= SMN.maxSendsPerRun) break;
-        writeOutbox_(c, e.key, e.text);
+        // 打刻修正は【出勤】【退勤】として二重に送らず、修正として1回だけ知らせます。
+        writeOutbox_(c, e.key, isKnown ? correctionText_(e, previousAt) : eventText_(e), e.at);
         sendOutbox_(c);
-        known[e.key] = String(now);
+        known[e.key] = doneValue_(now, e.at);
         sent++;
+        if (isKnown) corrections++;
       }
       cleanup_(now);
       p.setProperty('SMN_LAST_SUCCESS', new Date().toISOString());
       p.deleteProperty('SMN_LAST_ERROR');
-      console.log('確認完了。新規通知: ' + sent + '件');
+      console.log('確認完了。新規通知: ' + sent + '件（うち打刻修正: ' + corrections + '件）');
     } catch (e) {
       p.setProperty('SMN_LAST_ERROR', new Date().toISOString() + ' ' + String(e.message).slice(0, 300));
       throw e; // GASの実行履歴・トリガーエラー通知で確認できます。
@@ -147,6 +161,7 @@ function stopNotifications() {
 function showStatus() {
   const p = props_();
   console.log('通知: ' + (p.getProperty('SMN_ENABLED') === '1' ? '有効' : '停止'));
+  console.log('打刻の識別方式: ' + (p.getProperty('SMN_KEY_VERSION') || '更新前'));
   console.log('最終確認成功: ' + (p.getProperty('SMN_LAST_SUCCESS') || '未実行'));
   console.log('送信待ち: ' + (p.getProperty(SMN.outboxKey) ? 'あり' : 'なし'));
   console.log('最終エラー: ' + (p.getProperty('SMN_LAST_ERROR') || 'なし'));
@@ -160,7 +175,7 @@ function skipPendingAfterReview() {
   return locked_(function () {
     const pending = readOutbox_();
     if (!pending) { console.log('送信待ちはありません。'); return; }
-    props_().setProperty(pending.key, String(Date.now()));
+    props_().setProperty(pending.key, doneValue_(Date.now(), pending.punchAt));
     props_().deleteProperty(SMN.outboxKey);
     console.log('送信待ち1件を再送せず処理済みにしました。');
   });
@@ -215,6 +230,33 @@ function digest_(s) {
 }
 function clean_(s) { return String(s || '').replace(/[\r\n\t]/g, ' ').slice(0, 100); }
 
+/**
+ * 通知済み記録の値です。「通知した時刻|打刻の時刻」の形で保存します。
+ * 打刻の時刻を持たせることで、後から打刻が修正されたことを次回以降に検出できます。
+ */
+function doneValue_(notifiedAt, punchAt) {
+  return punchAt == null ? String(notifiedAt) : String(notifiedAt) + '|' + String(punchAt);
+}
+function doneNotifiedAt_(value) {
+  return Number(String(value == null ? '' : value).split('|')[0]);
+}
+function donePunchAt_(value) {
+  const parts = String(value == null ? '' : value).split('|');
+  if (parts.length < 2) return null;
+  const at = Number(parts[1]);
+  return Number.isFinite(at) ? at : null;
+}
+
+function seedKnownEvents_(p, known, allEvents, now) {
+  const seed = {};
+  allEvents.filter(e => e.at <= now).forEach(function (e) {
+    seed[e.key] = doneValue_(now, e.at);
+    known[e.key] = seed[e.key];
+  });
+  if (Object.keys(seed).length) p.setProperties(seed, false);
+  p.setProperty('SMN_KEY_VERSION', SMN.keyVersion);
+}
+
 function token_(c, refresh) {
   const cache = CacheService.getScriptCache();
   const key = 'smn-token-' + digest_([c.contract, c.clientId, c.clientSecret].join('|'));
@@ -261,28 +303,68 @@ function fetchResults_(c, now) {
   throw new Error('勤怠の全ページを取得できませんでした。');
 }
 
+function punchAt_(value) {
+  if (typeof value !== 'string' || !/T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(value)) {
+    throw new Error('勤怠の日時形式が想定と異なります。');
+  }
+  const at = Date.parse(String(value).replace(/Z$/, '+09:00'));
+  if (!Number.isFinite(at)) throw new Error('勤怠の日時を読み取れませんでした。');
+  return at;
+}
+
+function punchLabel_(at) { return Utilities.formatDate(new Date(at), SMN.timezone, 'M/d HH:mm:ss'); }
+
+function eventText_(e) {
+  return '【' + e.label + '】' + e.staffName + '\n' + punchLabel_(e.at) + (e.storeName ? '\n' + e.storeName : '');
+}
+
+function correctionText_(e, previousAt) {
+  return '【' + e.label + '修正】' + e.staffName + '\n' +
+    punchLabel_(previousAt) + ' → ' + punchLabel_(e.at) + (e.storeName ? '\n' + e.storeName : '');
+}
+
+/**
+ * 勤怠実績の行を通知イベントに変換します。
+ * 識別子には打刻時刻を含めません。含めると、打刻修正で時刻が変わるたびに
+ * 別の打刻とみなされ、出勤が二重に通知されてしまいます。
+ * 代わりに「契約・スタッフ・店舗・勤務日・その日の何件目・出勤/退勤」で識別します。
+ */
 function events_(rows, c) {
-  const unique = {};
+  const groups = {};
   for (const r of rows) {
-    if (!r || r.staffId == null || r.storeId == null || !r.attendanceAt || !Object.prototype.hasOwnProperty.call(r, 'leavingAt')) {
+    if (!r || r.staffId == null || r.storeId == null || !r.shiftDate || !r.attendanceAt ||
+        !Object.prototype.hasOwnProperty.call(r, 'leavingAt')) {
       throw new Error('勤怠APIの必須項目が不足しています。通知を止めて仕様を確認してください。');
     }
     if (c.staffIds && !c.staffIds.split(',').includes(String(r.staffId))) continue;
     if (c.storeIds && !c.storeIds.split(',').includes(String(r.storeId))) continue;
-    [['attendanceAt', '出勤'], ['leavingAt', '退勤']].forEach(function (pair) {
-      const value = r[pair[0]];
-      if (value == null || value === '') return;
-      if (typeof value !== 'string' || !/T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(value)) {
-        throw new Error('勤怠の日時形式が想定と異なります。');
-      }
-      const at = Date.parse(String(value).replace(/Z$/, '+09:00'));
-      if (!Number.isFinite(at)) throw new Error('勤怠の日時を読み取れませんでした。');
-      const key = SMN.donePrefix + digest_([c.contract, r.staffId, r.storeId, pair[0], at].join('|'));
-      const time = Utilities.formatDate(new Date(at), SMN.timezone, 'M/d HH:mm:ss');
-      unique[key] = {key: key, at: at, text: '【' + pair[1] + '】' + clean_(r.staffName || '従業員ID ' + r.staffId) + '\n' +
-        time + (r.storeName ? '\n' + clean_(r.storeName) : '')};
-    });
+    const groupId = [r.staffId, r.storeId, String(r.shiftDate)].join('|');
+    (groups[groupId] = groups[groupId] || []).push(r);
   }
+  const unique = {};
+  Object.keys(groups).forEach(function (groupId) {
+    // 中抜けなどで同じ日に複数の勤務がある場合に備え、出勤時刻順の通し番号で区別します。
+    const ordered = groups[groupId].slice().sort(function (a, b) {
+      return punchAt_(a.attendanceAt) - punchAt_(b.attendanceAt);
+    });
+    ordered.forEach(function (r, ordinal) {
+      [['attendanceAt', '出勤'], ['leavingAt', '退勤']].forEach(function (pair) {
+        const value = r[pair[0]];
+        if (value == null || value === '') return;
+        const at = punchAt_(value);
+        const key = SMN.donePrefix + digest_(
+          [SMN.keyVersion, c.contract, r.staffId, r.storeId, String(r.shiftDate), ordinal, pair[0]].join('|'));
+        const event = {
+          key: key, at: at, slot: pair[0], label: pair[1],
+          staffId: r.staffId, storeId: r.storeId, shiftDate: String(r.shiftDate),
+          staffName: clean_(r.staffName || '従業員ID ' + r.staffId),
+          storeName: r.storeName ? clean_(r.storeName) : ''
+        };
+        event.text = eventText_(event);
+        unique[key] = event;
+      });
+    });
+  });
   return Object.keys(unique).map(k => unique[k]).sort((a, b) => a.at - b.at || a.key.localeCompare(b.key));
 }
 
@@ -291,10 +373,11 @@ function readOutbox_() {
   return raw ? JSON.parse(raw) : null;
 }
 
-function writeOutbox_(c, key, text) {
+function writeOutbox_(c, key, text, punchAt) {
   if (readOutbox_()) throw new Error('前の通知が送信待ちです。上書きせず再送を先に行ってください。');
   props_().setProperty(SMN.outboxKey, JSON.stringify({
     key: key, to: c.userId, identity: lineIdentity_(c), text: text,
+    punchAt: punchAt == null ? null : punchAt,
     retryKey: Utilities.getUuid(), firstAttemptAt: null
   }));
 }
@@ -315,7 +398,14 @@ function sendOutbox_(c) {
   if (!q) return;
   const hadPriorAttempt = q.firstAttemptAt != null;
   if (q.to !== c.userId || q.identity !== lineIdentity_(c)) throw new Error('送信待ちの作成後にLINEの設定が変わっています。送信履歴を確認してください。');
-  if (p.getProperty(q.key)) { p.deleteProperty(SMN.outboxKey); return; }
+  const recorded = p.getProperty(q.key);
+  const pendingPunchAt = q.punchAt == null ? null : q.punchAt;
+  // 同じ打刻を同じ時刻で通知済みのときだけ送信を省きます。
+  // 打刻修正の通知は記録済みの時刻と異なるため、ここで落とさず送信します。
+  if (recorded !== null && donePunchAt_(recorded) === pendingPunchAt) {
+    p.deleteProperty(SMN.outboxKey);
+    return;
+  }
   if (q.firstAttemptAt != null && Date.now() - q.firstAttemptAt >= SMN.retryHours * 3600000) {
     throw new Error('送信結果不明のまま23時間を超えました。LINEのトークで確認後、skipPendingAfterReview でこの1件を処理済みにしてください。');
   }
@@ -336,7 +426,7 @@ function sendOutbox_(c) {
   const headers = response.getAllHeaders();
   const accepted = Object.keys(headers).some(k => k.toLowerCase() === 'x-line-accepted-request-id' && headers[k]);
   if ((status >= 200 && status < 300) || (status === 409 && accepted)) {
-    p.setProperty(q.key, String(Date.now()));
+    p.setProperty(q.key, doneValue_(Date.now(), pendingPunchAt));
     p.deleteProperty(SMN.outboxKey);
     return;
   }
@@ -382,10 +472,11 @@ function cleanup_(now) {
   const values = p.getProperties();
   const testKey = SMN.donePrefix + digest_('TEST|' + lineIdentity_(lineConfig_()));
   const cutoff = now - SMN.retentionDays * 86400000;
-  Object.keys(values).filter(k => k.startsWith(SMN.donePrefix) && k !== testKey && Number(values[k]) < cutoff)
+  Object.keys(values).filter(k => k.startsWith(SMN.donePrefix) && k !== testKey && doneNotifiedAt_(values[k]) < cutoff)
     .forEach(k => p.deleteProperty(k));
   p.setProperty('SMN_CLEANED_DATE', today);
 }
+
 function diagnoseTimecard() {
   return locked_(function () {
     const c = config_();
@@ -404,6 +495,7 @@ function diagnoseTimecard() {
     console.log('診断時刻（日本時間）: ' + fmt(now));
     console.log('通知開始（日本時間）: ' + fmt(started));
     console.log('通知: ' + (state.SMN_ENABLED === '1' ? '有効' : '停止'));
+    console.log('打刻の識別方式: ' + (state.SMN_KEY_VERSION || '更新前'));
     console.log('開始時の対象設定: ' +
       (state.SMN_IDENTITY === configIdentity_(c) ? '一致' : '不一致'));
     console.log('対象従業員: ' + (c.staffIds || '全員') +
@@ -411,6 +503,11 @@ function diagnoseTimecard() {
     console.log('送信待ち: ' + (state[SMN.outboxKey] ? 'あり' : 'なし'));
 
     const rows = fetchResults_(c, new Date(now));
+    let allEvents = null;
+    let eventsError = '';
+    try { allEvents = events_(rows, c); }
+    catch (e) { eventsError = clean_(e.message); }
+
     const recent = rows.slice().sort(function (a, b) {
       return (Date.parse(b.attendanceAt) || 0) -
         (Date.parse(a.attendanceAt) || 0);
@@ -425,9 +522,13 @@ function diagnoseTimecard() {
       let relation = '比較不可';
 
       if (r.leavingAt) {
-        try {
-          const event = events_([r], c).find(function (e) {
-            return e.text.startsWith('【退勤】');
+        if (!allEvents) {
+          reason = '勤怠検証エラー: ' + eventsError;
+        } else {
+          const leavingAt = Date.parse(String(r.leavingAt).replace(/Z$/, '+09:00'));
+          const event = allEvents.find(function (e) {
+            return e.slot === 'leavingAt' && e.staffId === r.staffId &&
+              e.storeId === r.storeId && e.shiftDate === String(r.shiftDate) && e.at === leavingAt;
           });
 
           if (!event) {
@@ -440,7 +541,9 @@ function diagnoseTimecard() {
                 ? '通知開始より前' : '通知開始以降';
             }
 
-            if (recorded) {
+            if (recorded && donePunchAt_(recorded) !== null && donePunchAt_(recorded) !== event.at) {
+              reason = '打刻修正あり（次回の確認で修正を通知）';
+            } else if (recorded) {
               reason = '処理済み記録あり（送信・除外の内訳は未保存）';
             } else if (event.at > now) {
               reason = '未来の退勤時刻のため除外';
@@ -454,8 +557,6 @@ function diagnoseTimecard() {
               reason = '未処理の通知対象';
             }
           }
-        } catch (e) {
-          reason = '勤怠検証エラー: ' + clean_(e.message);
         }
       }
 
@@ -468,7 +569,7 @@ function diagnoseTimecard() {
         退勤_丸め後: fmt(r.leavingAtRounded),
         開始との比較: relation,
         判定: reason,
-        処理記録時刻: recorded ? fmt(Number(recorded)) : 'なし'
+        処理記録時刻: recorded ? fmt(doneNotifiedAt_(recorded)) : 'なし'
       }));
     });
   });
