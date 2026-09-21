@@ -84,7 +84,7 @@ function run(label, file, script) {
 
 const row = (o) => Object.assign({
   staffId: 7, storeId: 2, shiftDate: '2026-09-21',
-  staffName: '高田哲平', storeName: 'LIG高田馬場店', leavingAt: null
+  staffName: '山田太郎', storeName: 'LIG高田馬場店', leavingAt: null
 }, o);
 
 const NOW = Date.parse('2026-09-21T13:00:00+09:00');
